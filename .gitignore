@@ -1,0 +1,23 @@
+# --- IntelliJ IDEA ---
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# --- Gradle ---
+.gradle/
+build/
+bin/
+target/
+
+# --- Build / System files ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Environment and local properties ---
+application-local.properties
+.env
