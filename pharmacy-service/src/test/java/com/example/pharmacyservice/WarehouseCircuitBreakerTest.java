@@ -1,6 +1,8 @@
 package com.example.pharmacyservice;
 
 import com.example.pharmacyservice.dto.StockCheckResponse;
+import com.example.pharmacyservice.model.Medicine;
+import com.example.pharmacyservice.repository.MedicineRepository;
 import com.example.pharmacyservice.service.WarehouseClientService;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,6 +19,9 @@ class WarehouseCircuitBreakerTest {
     @Autowired
     private WarehouseClientService warehouseClientService;
 
+    @Autowired
+    private MedicineRepository medicineRepository;
+
     private CircuitBreaker circuitBreaker;
 
     @BeforeEach
@@ -24,6 +29,15 @@ class WarehouseCircuitBreakerTest {
         circuitBreaker = warehouseClientService.getCircuitBreakerRegistry().circuitBreaker("warehouseCB");
         circuitBreaker.reset();
         warehouseClientService.setSimulateDown(false);
+
+        // Khởi tạo dữ liệu mẫu nếu chưa có
+        if (medicineRepository.findByName("Paracetamol 500mg").isEmpty()) {
+            medicineRepository.save(Medicine.builder()
+                    .name("Paracetamol 500mg")
+                    .quantity(100)
+                    .unitPrice(2500.0)
+                    .build());
+        }
     }
 
     @Test
@@ -37,36 +51,57 @@ class WarehouseCircuitBreakerTest {
     }
 
     @Test
-    @DisplayName("Khi giả lập warehouse-service bị sập, sau một số lần lỗi, mạch chuyển sang OPEN và Fail-fast nhanh")
-    void testCircuitBreakerOpensAndFailsFastWhenWarehouseDown() {
-        // Trạng thái ban đầu phải là CLOSED
-        assertEquals(CircuitBreaker.State.CLOSED, circuitBreaker.getState(),
-                "Trạng thái ban đầu của mạch phải là CLOSED");
+    @DisplayName("Hàm checkWarehouseFallback(Exception e) trả về thông báo và dữ liệu tồn kho cục bộ chuẩn xác")
+    void testCheckWarehouseFallbackDirectCall() {
+        Exception testException = new RuntimeException("Kho tổng sập đột ngột");
+
+        // Gọi trực tiếp hàm fallback checkWarehouseFallback(Exception e)
+        StockCheckResponse fallbackResp = warehouseClientService.checkWarehouseFallback(testException);
+
+        assertNotNull(fallbackResp);
+        assertEquals("Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch",
+                fallbackResp.getMessage(), "Thông báo trả về phải đúng chính xác yêu cầu");
+        assertEquals("LOCAL_INVENTORY", fallbackResp.getStockSource(), "Nguồn tồn kho phải là LOCAL_INVENTORY");
+        assertTrue(fallbackResp.getAvailableStock() > 0, "Số lượng tồn kho tại chỗ phải lớn hơn 0");
+        assertTrue(fallbackResp.isAllowSale(), "Phải cho phép tiếp tục bán hàng dựa trên số lượng tồn kho tại chỗ");
+    }
+
+    @Test
+    @DisplayName("Khi kho tổng lỗi và mạch OPEN, fallbackMethod được kích hoạt, cho phép bán hàng bằng tồn kho tại chỗ thay vì báo lỗi 500")
+    void testFallbackActivatedWhenWarehouseDownAndCircuitOpens() {
+        // Trạng thái ban đầu: CLOSED
+        assertEquals(CircuitBreaker.State.CLOSED, circuitBreaker.getState());
 
         // Giả lập warehouse-service bị sập
         warehouseClientService.setSimulateDown(true);
 
-        // Gọi 4 lần lỗi (đạt minimumNumberOfCalls = 4, tỉ lệ lỗi = 100% > 50%)
+        // Gọi các lần đầu (mỗi lần bị lỗi, fallbackMethod tự động xử lý trả về thông báo cục bộ thay vì ném lỗi 500)
         for (int i = 1; i <= 4; i++) {
-            StockCheckResponse resp = warehouseClientService.checkStock("Paracetamol 500mg");
+            StockCheckResponse resp = warehouseClientService.checkWarehouse("Paracetamol 500mg");
             assertNotNull(resp);
-            assertFalse(resp.isInStock());
+            assertEquals("Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch",
+                    resp.getMessage());
+            assertEquals("LOCAL_INVENTORY", resp.getStockSource());
+            assertTrue(resp.isAllowSale(), "Vẫn cho phép tiếp tục bán hàng với tồn kho tại chỗ");
+            assertTrue(resp.getAvailableStock() > 0);
         }
 
-        // Sau 4 lần lỗi (100% failure rate > 50%), mạch phải tự động chuyển sang OPEN
+        // Sau 4 lần lỗi liên tiếp (100% failure rate > 50%), mạch ngắt sang OPEN
         assertEquals(CircuitBreaker.State.OPEN, circuitBreaker.getState(),
-                "Sau các lần gọi lỗi liên tiếp, mạch phải chuyển sang OPEN!");
+                "Circuit Breaker phải chuyển sang trạng thái OPEN");
 
-        // Lần gọi thứ 5: Vì mạch đang OPEN, Resilience4j phải ngắt mạch ngay lập tức (Fail-fast)
+        // Khi mạch OPEN, gọi lại hàm: Resilience4j ngắt mạch ngay lập tức (Fail-fast),
+        // fallbackMethod vẫn cung cấp thông tin tồn kho tại chỗ gần như tức thì (< 50ms)
         long start = System.currentTimeMillis();
-        StockCheckResponse failFastResp = warehouseClientService.checkStock("Paracetamol 500mg");
-        long executionTime = System.currentTimeMillis() - start;
+        StockCheckResponse openResp = warehouseClientService.checkWarehouse("Paracetamol 500mg");
+        long duration = System.currentTimeMillis() - start;
 
-        // Kiểm tra phản hồi Fail-fast
-        assertTrue(failFastResp.isFailFast(), "Phản hồi phải kích hoạt chế độ Fail-Fast!");
-        assertEquals("OPEN", failFastResp.getCircuitBreakerState(), "Mạch phải ở trạng thái OPEN!");
-        assertTrue(failFastResp.getMessage().contains("MẠCH ĐANG NGẮT (OPEN)"),
-                "Thông điệp phải thông báo mạch đang ngắt!");
-        assertTrue(executionTime < 50, "Fail-fast phải trả về gần như tức thì (< 50ms), tránh treo máy tính tiền!");
+        assertEquals("OPEN", openResp.getCircuitBreakerState());
+        assertTrue(openResp.isFailFast(), "Phải kích hoạt cờ Fail-fast");
+        assertTrue(duration < 50, "Thời gian phản hồi phải siêu nhanh (< 50ms) để không làm treo máy tính tiền");
+        assertEquals("Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch",
+                openResp.getMessage());
+        assertEquals("LOCAL_INVENTORY", openResp.getStockSource());
+        assertTrue(openResp.isAllowSale(), "Người dùng vẫn có thể tiếp tục thao tác bán hàng!");
     }
 }

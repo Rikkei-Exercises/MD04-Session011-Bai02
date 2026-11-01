@@ -1,11 +1,11 @@
 package com.example.pharmacyservice.controller;
 
 import com.example.pharmacyservice.dto.StockCheckResponse;
+import com.example.pharmacyservice.model.Medicine;
 import com.example.pharmacyservice.service.WarehouseClientService;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -23,19 +23,62 @@ public class RetailController {
     /**
      * API Bán lẻ - Kiểm tra hàng tồn từ Kho tổng (warehouse-service).
      * Được bảo vệ bởi Circuit Breaker (warehouseCB).
-     * Khi kho tổng bị sự cố/sập, sau 1 số lần lỗi mạch sẽ chuyển OPEN và Fail-fast ngay lập tức.
+     * Khi kho tổng bị sự cố/sập hoặc mạch ngắt (OPEN):
+     * Fallback checkWarehouseFallback() tự động chuyển sang sử dụng tồn kho tại chỗ (LOCAL_INVENTORY),
+     * trả về HTTP 200 OK kèm thông báo hướng dẫn, không bao giờ trả về lỗi 500.
      */
     @GetMapping("/check-warehouse-stock")
     public ResponseEntity<StockCheckResponse> checkWarehouseStock(
             @RequestParam(defaultValue = "Paracetamol 500mg") String medicineName) {
         
         long startTime = System.currentTimeMillis();
-        StockCheckResponse response = warehouseClientService.checkStock(medicineName);
+        StockCheckResponse response = warehouseClientService.checkWarehouse(medicineName);
         long totalTime = System.currentTimeMillis() - startTime;
-        response.setExecutionTimeMs(totalTime);
+        if (response.getExecutionTimeMs() == 0) {
+            response.setExecutionTimeMs(totalTime);
+        }
 
-        HttpStatus status = response.isFailFast() ? HttpStatus.SERVICE_UNAVAILABLE : HttpStatus.OK;
-        return ResponseEntity.status(status).body(response);
+        // Luôn trả về 200 OK với dữ liệu tồn kho (kho tổng hoặc tại chỗ) để tiếp tục giao dịch
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * API Bán lẻ thuốc trực tiếp - Thực hiện giao dịch bán hàng.
+     * Khi kho tổng sập, hệ thống vẫn cho phép bán dựa trên tồn kho tại chỗ.
+     */
+    @PostMapping("/sell")
+    public ResponseEntity<Map<String, Object>> sellMedicine(
+            @RequestParam(defaultValue = "Paracetamol 500mg") String medicineName,
+            @RequestParam(defaultValue = "2") int quantity) {
+
+        StockCheckResponse stockInfo = warehouseClientService.checkWarehouse(medicineName);
+        Map<String, Object> result = new HashMap<>();
+        result.put("medicineName", medicineName);
+        result.put("requestedQuantity", quantity);
+        result.put("circuitBreakerState", stockInfo.getCircuitBreakerState());
+        result.put("stockSource", stockInfo.getStockSource());
+        result.put("stockMessage", stockInfo.getMessage());
+
+        if (stockInfo.getAvailableStock() >= quantity) {
+            // Giảm tồn kho tại chỗ nếu có trong DB
+            warehouseClientService.getMedicineRepository().findByName(medicineName)
+                    .or(() -> warehouseClientService.getMedicineRepository().findByNameIgnoreCase(medicineName))
+                    .ifPresent(med -> {
+                        med.setQuantity(Math.max(0, med.getQuantity() - quantity));
+                        warehouseClientService.getMedicineRepository().save(med);
+                    });
+
+            result.put("status", "SUCCESS");
+            result.put("remainingStock", Math.max(0, stockInfo.getAvailableStock() - quantity));
+            result.put("transactionStatus", "Giao dịch bán lẻ thành công!");
+            result.put("note", "Hệ thống tiếp tục phục vụ khách hàng bình thường mà không bị gián đoạn hay nhận mã lỗi 500.");
+            return ResponseEntity.ok(result);
+        } else {
+            result.put("status", "OUT_OF_STOCK");
+            result.put("remainingStock", stockInfo.getAvailableStock());
+            result.put("transactionStatus", "Số lượng tồn kho không đủ để bán.");
+            return ResponseEntity.badRequest().body(result);
+        }
     }
 
     /**

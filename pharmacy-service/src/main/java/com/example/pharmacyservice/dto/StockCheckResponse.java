@@ -12,10 +12,14 @@ import lombok.NoArgsConstructor;
 public class StockCheckResponse {
     private String medicineName;
     private int warehouseStock;
+    private int localStock;
+    private int availableStock;
     private boolean inStock;
+    private String stockSource; // "WAREHOUSE", "LOCAL_INVENTORY"
     private String status;
     private String circuitBreakerState;
     private String message;
     private long executionTimeMs;
     private boolean failFast;
+    private boolean allowSale;
 }

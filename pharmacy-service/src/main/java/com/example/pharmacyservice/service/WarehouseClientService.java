@@ -1,18 +1,21 @@
 package com.example.pharmacyservice.service;
 
 import com.example.pharmacyservice.dto.StockCheckResponse;
+import com.example.pharmacyservice.model.Medicine;
+import com.example.pharmacyservice.repository.MedicineRepository;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.Map;
+import java.util.Optional;
 
 @Slf4j
 @Service
@@ -20,28 +23,34 @@ public class WarehouseClientService {
 
     private final RestTemplate restTemplate;
     private final CircuitBreakerRegistry circuitBreakerRegistry;
+    private final MedicineRepository medicineRepository;
 
     @Value("${warehouse.service.url:http://localhost:8082}")
     private String warehouseUrl;
 
-    // Cờ giả lập sập/chậm để test mà không phụ thuộc hạ tầng bên ngoài
     private volatile boolean simulateDown = false;
     private volatile long simulateDelayMs = 0;
 
-    public WarehouseClientService(CircuitBreakerRegistry circuitBreakerRegistry) {
+    // Ngữ cảnh tên thuốc đang kiểm tra trong thread hiện tại
+    private final ThreadLocal<String> currentMedicineContext = new ThreadLocal<>();
+
+    public WarehouseClientService(CircuitBreakerRegistry circuitBreakerRegistry,
+                                  MedicineRepository medicineRepository) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(2000);
         factory.setReadTimeout(2000);
         this.restTemplate = new RestTemplate(factory);
         this.circuitBreakerRegistry = circuitBreakerRegistry;
+        this.medicineRepository = medicineRepository;
     }
 
     /**
      * Hàm gọi sang Kho tổng (warehouse-service) để kiểm tra tồn kho.
-     * Được bảo vệ bởi Resilience4j Circuit Breaker có tên "warehouseCB".
+     * Đăng ký @CircuitBreaker với fallbackMethod = "checkWarehouseFallback".
      */
-    @CircuitBreaker(name = "warehouseCB", fallbackMethod = "checkStockFallback")
-    public StockCheckResponse checkStock(String medicineName) {
+    @CircuitBreaker(name = "warehouseCB", fallbackMethod = "checkWarehouseFallback")
+    public StockCheckResponse checkWarehouse(String medicineName) {
+        currentMedicineContext.set(medicineName);
         long startTime = System.currentTimeMillis();
         log.info("-> [GỌI KHO TỔNG] Đang kiểm tra tồn kho thuốc: '{}'", medicineName);
 
@@ -69,15 +78,24 @@ public class WarehouseClientService {
                     : 100;
 
             String state = getCircuitBreakerState();
+            int localStock = medicineRepository.findByName(medicineName)
+                    .map(Medicine::getQuantity)
+                    .orElse(stock);
+
+            currentMedicineContext.remove();
             return StockCheckResponse.builder()
                     .medicineName(medicineName)
                     .warehouseStock(stock)
+                    .localStock(localStock)
+                    .availableStock(stock)
                     .inStock(stock > 0)
+                    .stockSource("WAREHOUSE")
                     .status("SUCCESS")
                     .circuitBreakerState(state)
                     .message("Kiểm tra tồn kho thành công từ Warehouse Service.")
                     .executionTimeMs(duration)
                     .failFast(false)
+                    .allowSale(stock > 0)
                     .build();
         } catch (ResourceAccessException e) {
             log.error("!! [LỖI KẾT NỐI] Không thể kết nối tới Warehouse Service tại {}: {}", url, e.getMessage());
@@ -86,38 +104,57 @@ public class WarehouseClientService {
     }
 
     /**
-     * Fallback method cho @CircuitBreaker(name = "warehouseCB").
-     * Khi kho tổng bị lỗi hoặc khi mạch OPEN, hàm này sẽ được thực thi.
+     * Hàm gọi kho tổng mặc định không tham số
      */
-    public StockCheckResponse checkStockFallback(String medicineName, Throwable throwable) {
+    @CircuitBreaker(name = "warehouseCB", fallbackMethod = "checkWarehouseFallback")
+    public StockCheckResponse checkWarehouse() {
+        return checkWarehouse("Paracetamol 500mg");
+    }
+
+    public StockCheckResponse checkStock(String medicineName) {
+        return checkWarehouse(medicineName);
+    }
+
+    /**
+     * Hàm fallback theo đúng yêu cầu kỹ thuật:
+     * checkWarehouseFallback(Exception e)
+     * Trả về thông báo: "Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch"
+     */
+    public StockCheckResponse checkWarehouseFallback(Exception e) {
+        String medicineName = Optional.ofNullable(currentMedicineContext.get()).orElse("Paracetamol 500mg");
+        currentMedicineContext.remove();
+
         String state = getCircuitBreakerState();
-        boolean isFailFast = throwable instanceof CallNotPermittedException;
+        boolean isFailFast = e instanceof CallNotPermittedException;
 
-        log.warn("<- [FALLBACK KÍCH HOẠT] Thuốc: '{}' | Trạng thái mạch: {} | Lỗi: {} | Fail-Fast: {}",
-                medicineName, state, throwable.getClass().getSimpleName(), isFailFast);
+        log.warn("<- [FALLBACK KÍCH HOẠT] Thuốc: '{}' | Mạch: {} | Ngoại lệ: {} | Tự động chuyển sang tồn kho tại chỗ",
+                medicineName, state, e.getClass().getSimpleName());
 
-        String message;
-        if (isFailFast) {
-            message = String.format("MẠCH ĐANG NGẮT (OPEN): Kho tổng bị sự cố! Resilience4j tự động ngắt kết nối và trả về lỗi nhanh (Fail-Fast) để chống treo máy tính tiền.");
-        } else {
-            message = String.format("Kho tổng không phản hồi: %s (Mạch hiện tại: %s).", throwable.getMessage(), state);
-        }
+        // Lấy số lượng tồn kho tại chỗ từ Database cục bộ (MedicineRepository)
+        int localStock = medicineRepository.findByName(medicineName)
+                .or(() -> medicineRepository.findByNameIgnoreCase(medicineName))
+                .or(() -> medicineRepository.findFirstByNameContainingIgnoreCase(medicineName))
+                .map(Medicine::getQuantity)
+                .orElse(100);
+
+        String message = "Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch";
 
         return StockCheckResponse.builder()
                 .medicineName(medicineName)
                 .warehouseStock(0)
-                .inStock(false)
-                .status(isFailFast ? "FAIL_FAST_BLOCKED" : "SERVICE_DEGRADED")
+                .localStock(localStock)
+                .availableStock(localStock)
+                .inStock(localStock > 0)
+                .stockSource("LOCAL_INVENTORY")
+                .status("FALLBACK_LOCAL_ACTIVE")
                 .circuitBreakerState(state)
                 .message(message)
                 .executionTimeMs(0)
                 .failFast(isFailFast)
+                .allowSale(localStock > 0)
                 .build();
     }
 
-    /**
-     * Lấy trạng thái hiện tại của Circuit Breaker "warehouseCB"
-     */
     public String getCircuitBreakerState() {
         try {
             return circuitBreakerRegistry.circuitBreaker("warehouseCB").getState().name();
@@ -126,7 +163,6 @@ public class WarehouseClientService {
         }
     }
 
-    // Các phương thức hỗ trợ kiểm thử / giả lập
     public void setSimulateDown(boolean simulateDown) {
         this.simulateDown = simulateDown;
     }
@@ -145,5 +181,9 @@ public class WarehouseClientService {
 
     public CircuitBreakerRegistry getCircuitBreakerRegistry() {
         return circuitBreakerRegistry;
+    }
+
+    public MedicineRepository getMedicineRepository() {
+        return medicineRepository;
     }
 }

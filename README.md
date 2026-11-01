@@ -193,22 +193,40 @@ resilience4j.circuitbreaker.instances.warehouseCB.register-health-indicator=true
 ```
 
 ### C. Triển khai Code trong `pharmacy-service`
-1. **Service gọi Kho tổng (`WarehouseClientService.java`)**:
+1. **Service gọi Kho tổng & Hàm Fallback (`WarehouseClientService.java`)**:
    ```java
-   @CircuitBreaker(name = "warehouseCB", fallbackMethod = "checkStockFallback")
-   public StockCheckResponse checkStock(String medicineName) {
+   @CircuitBreaker(name = "warehouseCB", fallbackMethod = "checkWarehouseFallback")
+   public StockCheckResponse checkWarehouse(String medicineName) {
        // Gọi API Kho tổng (warehouse-service)
        // Nếu kho sập hoặc ném ngoại lệ -> kích hoạt tính toán Circuit Breaker
    }
 
-   public StockCheckResponse checkStockFallback(String medicineName, Throwable throwable) {
-       boolean isFailFast = throwable instanceof CallNotPermittedException;
-       // Khi mạch OPEN -> throwable là CallNotPermittedException (Fail-fast tức thì ~0ms)
-       // ...
+   /**
+    * Hàm fallback: checkWarehouseFallback(Exception e)
+    * Khi mạch ngắt hoặc kho lỗi: chuyển sang dùng tồn kho tại chỗ (LOCAL_INVENTORY)
+    * Trả về thông báo hướng dẫn cụ thể thay vì ném lỗi 500
+    */
+   public StockCheckResponse checkWarehouseFallback(Exception e) {
+       String medicineName = Optional.ofNullable(currentMedicineContext.get()).orElse("Paracetamol 500mg");
+       int localStock = medicineRepository.findByName(medicineName)
+               .map(Medicine::getQuantity).orElse(100);
+
+       return StockCheckResponse.builder()
+               .medicineName(medicineName)
+               .warehouseStock(0)
+               .localStock(localStock)
+               .availableStock(localStock)
+               .inStock(localStock > 0)
+               .stockSource("LOCAL_INVENTORY")
+               .circuitBreakerState(getCircuitBreakerState())
+               .message("Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch")
+               .allowSale(localStock > 0)
+               .build();
    }
    ```
 2. **Controller bán lẻ (`RetailController.java`)**:
-   - `GET /api/v1/retail/check-warehouse-stock?medicineName=...`: Bán lẻ kiểm tra tồn kho từ kho tổng.
+   - `GET /api/v1/retail/check-warehouse-stock?medicineName=...`: Bán lẻ kiểm tra tồn kho. Khi kho lỗi/mạch OPEN, luôn trả về HTTP 200 OK kèm dữ liệu tồn kho tại chỗ và thông báo hướng dẫn.
+   - `POST /api/v1/retail/sell?medicineName=...&quantity=...`: Bán lẻ thuốc trực tiếp dựa trên tồn kho tại chỗ khi kho tổng sập.
    - `POST /api/v1/retail/simulate-warehouse?down=true`: Giả lập kho tổng bị sập để kiểm thử.
    - `GET /api/v1/retail/circuit-breaker-status`: Kiểm tra trạng thái thời gian thực của Circuit Breaker (`CLOSED`, `OPEN`, `HALF_OPEN`).
    - `POST /api/v1/retail/circuit-breaker/reset`: Reset Circuit Breaker về `CLOSED`.
@@ -225,8 +243,10 @@ cd pharmacy-service
 ```
 Bộ kiểm thử sẽ tự động xác minh:
 1. Thông số cấu hình trên Git: `failureRateThreshold = 50%`, `waitDurationInOpenState = 20s`.
-2. Khi kho tổng sập: Sau các lần gọi lỗi, mạch chuyển từ `CLOSED` sang `OPEN`.
-3. Khi mạch `OPEN`: Request tiếp theo được ngắt mạch ngay lập tức (**Fail-fast**), thời gian xử lý < 50ms, bảo vệ hệ thống bán lẻ.
+2. Hàm `checkWarehouseFallback(Exception e)` trả về chính xác thông báo:
+   `"Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch"` và cung cấp số lượng tồn kho tại chỗ (`LOCAL_INVENTORY`).
+3. Khi kho tổng sập: Sau các lần gọi lỗi, mạch chuyển từ `CLOSED` sang `OPEN`.
+4. Khi mạch `OPEN`: Request tiếp theo được ngắt mạch ngay lập tức (**Fail-fast** < 50ms) và trả về dữ liệu tồn kho cục bộ cho phép tiếp tục bán lẻ thay vì báo lỗi 500.
 
 ### Cách 2: Kiểm thử trực tiếp qua REST API (curl / Postman)
 
@@ -245,33 +265,67 @@ curl -X POST "http://localhost:8081/api/v1/retail/simulate-warehouse?down=true"
 ```bash
 curl -X GET "http://localhost:8081/api/v1/retail/check-warehouse-stock?medicineName=Paracetamol%20500mg"
 ```
-- Trong 4 lần gọi đầu tiên, dịch vụ phát hiện lỗi từ kho tổng và ghi nhận vào cửa sổ tính toán lỗi. Tỷ lệ lỗi đạt `100% > 50%`.
+- Khi kho tổng lỗi, hàm `checkWarehouseFallback(Exception e)` lập tức kích hoạt, trả về **HTTP 200 OK**:
+```json
+{
+  "medicineName": "Paracetamol 500mg",
+  "warehouseStock": 0,
+  "localStock": 100,
+  "availableStock": 100,
+  "inStock": true,
+  "stockSource": "LOCAL_INVENTORY",
+  "circuitBreakerState": "CLOSED",
+  "message": "Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch",
+  "allowSale": true
+}
+```
 
 #### Bước 4: Kiểm tra trạng thái Circuit Breaker
+Sau 4 lần gọi lỗi (tỷ lệ lỗi 100% > 50%), mạch chuyển sang OPEN:
 ```bash
 curl -X GET http://localhost:8081/api/v1/retail/circuit-breaker-status
 ```
 Kết quả: `state = "OPEN"`, `failureRate = 100.0%`.
 
-#### Bước 5: Kiểm tra cơ chế Fail-fast khi mạch OPEN
+#### Bước 5: Kiểm tra cơ chế Fail-fast và tiếp tục bán hàng khi mạch OPEN
 Gửi request bán lẻ kiểm tra tồn kho lần thứ 5:
 ```bash
 curl -X GET "http://localhost:8081/api/v1/retail/check-warehouse-stock?medicineName=Paracetamol%20500mg"
 ```
-Kết quả trả về HTTP 503 với JSON:
+Kết quả trả về **HTTP 200 OK** (thời gian phản hồi `0ms`):
 ```json
 {
   "medicineName": "Paracetamol 500mg",
   "warehouseStock": 0,
-  "inStock": false,
-  "status": "FAIL_FAST_BLOCKED",
+  "localStock": 100,
+  "availableStock": 100,
+  "inStock": true,
+  "stockSource": "LOCAL_INVENTORY",
   "circuitBreakerState": "OPEN",
-  "message": "MẠCH ĐANG NGẮT (OPEN): Kho tổng bị sự cố! Resilience4j tự động ngắt kết nối và trả về lỗi nhanh (Fail-Fast) để chống treo máy tính tiền.",
+  "message": "Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch",
   "executionTimeMs": 0,
-  "failFast": true
+  "failFast": true,
+  "allowSale": true
 }
 ```
-*Thời gian phản hồi là `0ms` (Fail-Fast), không hề mất thời gian chờ đợi hoặc treo giao dịch bán lẻ.*
+*Không nhận mã lỗi 500, người dùng có thể tiếp tục bán hàng dựa trên số lượng tồn kho tại chỗ (100 hộp Paracetamol).*
+
+Gửi request bán hàng trực tiếp:
+```bash
+curl -X POST "http://localhost:8081/api/v1/retail/sell?medicineName=Paracetamol%20500mg&quantity=2"
+```
+Kết quả trả về:
+```json
+{
+  "status": "SUCCESS",
+  "medicineName": "Paracetamol 500mg",
+  "requestedQuantity": 2,
+  "remainingStock": 98,
+  "stockSource": "LOCAL_INVENTORY",
+  "stockMessage": "Không thể kết nối kho tổng. Hệ thống sẽ sử dụng dữ liệu tồn kho cục bộ để tiếp tục giao dịch",
+  "transactionStatus": "Giao dịch bán lẻ thành công!"
+}
+```
 
 #### Bước 6: Sau 20 giây (wait-duration-in-open-state)
 Mạch tự động chuyển sang `HALF_OPEN`. Khi kho tổng hoạt động lại (`simulate-warehouse?down=false`), các request thành công sẽ đưa mạch trở lại `CLOSED`.
