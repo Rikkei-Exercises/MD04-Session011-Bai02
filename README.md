@@ -163,3 +163,116 @@ Gửi lại request `POST http://localhost:8081/api/v1/bill`:
 }
 ```
 *Tỷ lệ thuế mới (8%) đã được áp dụng tức thì mà không cần khởi động lại ứng dụng.*
+
+---
+
+## 4. Bài 2: Ngắt mạch tự động Resilience4j Circuit Breaker (@CircuitBreaker)
+
+### A. Bối cảnh & Yêu cầu
+- Khi bán lẻ tại `pharmacy-service`, hệ thống gọi API sang `warehouse-service` (Kho tổng) để kiểm tra lượng tồn kho.
+- Nếu kho tổng phản hồi chậm hoặc bị sập:
+  - Máy tính tiền bán lẻ có nguy cơ bị treo nghẽn nếu tiếp tục chờ đợi lâu.
+  - Sử dụng **Resilience4j Circuit Breaker** để tự ngắt mạch chuyển sang `OPEN`, kích hoạt cơ chế trả về lỗi nhanh (**Fail-fast**) gần như tức thì (~0ms) nhằm bảo vệ quầy thu ngân.
+- **Yêu cầu kỹ thuật**:
+  - Cấu hình Resilience4j trên Git (`pharmacy-config-repo/pharmacy-service.properties`):
+    - `failure-rate-threshold=50`
+    - `wait-duration-in-open-state=20s`
+  - Đánh dấu `@CircuitBreaker(name = "warehouseCB")` cho hàm gọi kho tổng.
+
+### B. Cấu hình Resilience4j trên Git (`pharmacy-config-repo/pharmacy-service.properties`)
+```properties
+# Resilience4j Circuit Breaker Configuration (warehouseCB)
+resilience4j.circuitbreaker.instances.warehouseCB.failure-rate-threshold=50
+resilience4j.circuitbreaker.instances.warehouseCB.wait-duration-in-open-state=20s
+resilience4j.circuitbreaker.instances.warehouseCB.sliding-window-type=COUNT_BASED
+resilience4j.circuitbreaker.instances.warehouseCB.sliding-window-size=6
+resilience4j.circuitbreaker.instances.warehouseCB.minimum-number-of-calls=4
+resilience4j.circuitbreaker.instances.warehouseCB.permitted-number-of-calls-in-half-open-state=2
+resilience4j.circuitbreaker.instances.warehouseCB.automatic-transition-from-open-to-half-open-enabled=true
+resilience4j.circuitbreaker.instances.warehouseCB.register-health-indicator=true
+```
+
+### C. Triển khai Code trong `pharmacy-service`
+1. **Service gọi Kho tổng (`WarehouseClientService.java`)**:
+   ```java
+   @CircuitBreaker(name = "warehouseCB", fallbackMethod = "checkStockFallback")
+   public StockCheckResponse checkStock(String medicineName) {
+       // Gọi API Kho tổng (warehouse-service)
+       // Nếu kho sập hoặc ném ngoại lệ -> kích hoạt tính toán Circuit Breaker
+   }
+
+   public StockCheckResponse checkStockFallback(String medicineName, Throwable throwable) {
+       boolean isFailFast = throwable instanceof CallNotPermittedException;
+       // Khi mạch OPEN -> throwable là CallNotPermittedException (Fail-fast tức thì ~0ms)
+       // ...
+   }
+   ```
+2. **Controller bán lẻ (`RetailController.java`)**:
+   - `GET /api/v1/retail/check-warehouse-stock?medicineName=...`: Bán lẻ kiểm tra tồn kho từ kho tổng.
+   - `POST /api/v1/retail/simulate-warehouse?down=true`: Giả lập kho tổng bị sập để kiểm thử.
+   - `GET /api/v1/retail/circuit-breaker-status`: Kiểm tra trạng thái thời gian thực của Circuit Breaker (`CLOSED`, `OPEN`, `HALF_OPEN`).
+   - `POST /api/v1/retail/circuit-breaker/reset`: Reset Circuit Breaker về `CLOSED`.
+
+---
+
+## 5. Hướng dẫn kiểm thử Circuit Breaker & Fail-Fast
+
+### Cách 1: Chạy tự động qua JUnit Test
+Chạy lệnh kiểm thử đã được tích hợp sẵn:
+```powershell
+cd pharmacy-service
+.\gradlew test --tests "com.example.pharmacyservice.WarehouseCircuitBreakerTest"
+```
+Bộ kiểm thử sẽ tự động xác minh:
+1. Thông số cấu hình trên Git: `failureRateThreshold = 50%`, `waitDurationInOpenState = 20s`.
+2. Khi kho tổng sập: Sau các lần gọi lỗi, mạch chuyển từ `CLOSED` sang `OPEN`.
+3. Khi mạch `OPEN`: Request tiếp theo được ngắt mạch ngay lập tức (**Fail-fast**), thời gian xử lý < 50ms, bảo vệ hệ thống bán lẻ.
+
+### Cách 2: Kiểm thử trực tiếp qua REST API (curl / Postman)
+
+#### Bước 1: Xem trạng thái ban đầu của mạch
+```bash
+curl -X GET http://localhost:8081/api/v1/retail/circuit-breaker-status
+```
+Kết quả: `state = "CLOSED"`.
+
+#### Bước 2: Giả lập kho tổng bị sập
+```bash
+curl -X POST "http://localhost:8081/api/v1/retail/simulate-warehouse?down=true"
+```
+
+#### Bước 3: Gọi API kiểm tra tồn kho liên tiếp 4 lần
+```bash
+curl -X GET "http://localhost:8081/api/v1/retail/check-warehouse-stock?medicineName=Paracetamol%20500mg"
+```
+- Trong 4 lần gọi đầu tiên, dịch vụ phát hiện lỗi từ kho tổng và ghi nhận vào cửa sổ tính toán lỗi. Tỷ lệ lỗi đạt `100% > 50%`.
+
+#### Bước 4: Kiểm tra trạng thái Circuit Breaker
+```bash
+curl -X GET http://localhost:8081/api/v1/retail/circuit-breaker-status
+```
+Kết quả: `state = "OPEN"`, `failureRate = 100.0%`.
+
+#### Bước 5: Kiểm tra cơ chế Fail-fast khi mạch OPEN
+Gửi request bán lẻ kiểm tra tồn kho lần thứ 5:
+```bash
+curl -X GET "http://localhost:8081/api/v1/retail/check-warehouse-stock?medicineName=Paracetamol%20500mg"
+```
+Kết quả trả về HTTP 503 với JSON:
+```json
+{
+  "medicineName": "Paracetamol 500mg",
+  "warehouseStock": 0,
+  "inStock": false,
+  "status": "FAIL_FAST_BLOCKED",
+  "circuitBreakerState": "OPEN",
+  "message": "MẠCH ĐANG NGẮT (OPEN): Kho tổng bị sự cố! Resilience4j tự động ngắt kết nối và trả về lỗi nhanh (Fail-Fast) để chống treo máy tính tiền.",
+  "executionTimeMs": 0,
+  "failFast": true
+}
+```
+*Thời gian phản hồi là `0ms` (Fail-Fast), không hề mất thời gian chờ đợi hoặc treo giao dịch bán lẻ.*
+
+#### Bước 6: Sau 20 giây (wait-duration-in-open-state)
+Mạch tự động chuyển sang `HALF_OPEN`. Khi kho tổng hoạt động lại (`simulate-warehouse?down=false`), các request thành công sẽ đưa mạch trở lại `CLOSED`.
+
