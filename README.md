@@ -440,4 +440,55 @@ curl "http://localhost:8083/api/v1/inventory/orders"
 curl "http://localhost:8083/api/v1/inventory/logs"
 ```
 
+---
+
+## 9. Notification Service - Gửi Hóa Đơn Điện Tử / Email
+
+Khi một sự kiện đơn hàng được tạo, `notification-service` (Port 8084) cùng lắng nghe topic `medicine-stock-events` để xử lý thông báo và gửi hóa đơn điện tử cho khách hàng.
+
+### A. Cơ chế Broadcast qua Multi Consumer Groups
+- `inventory-service` sử dụng `group-id: inventory-group`.
+- `notification-service` sử dụng `group-id: notification-group`.
+Do hai service thuộc **hai Consumer Group khác nhau**, Kafka sẽ **nhân bản và gửi đồng thời** sự kiện `OrderEvent` đến cả hai service một cách độc lập mà không bị tranh chấp partition:
+1. `inventory-service` nhận tin để trừ kho và thêm đơn hàng.
+2. `notification-service` nhận tin để phát sinh hóa đơn và gửi email cho khách.
+
+```
+                  ┌───────────────────────────┐
+                  │     pharmacy-service      │ (Producer - Port 8081)
+                  └─────────────┬─────────────┘
+                                │ Topic: medicine-stock-events
+                                ▼
+                  ┌───────────────────────────┐
+                  │       KAFKA BROKER        │
+                  └──────┬─────────────┬──────┘
+                         │             │
+        (group: inventory-group)     (group: notification-group)
+                         │             │
+                         ▼             ▼
+   ┌───────────────────────────┐     ┌───────────────────────────┐
+   │     inventory-service     │     │   notification-service    │ (Port 8084)
+   │  UPDATE medicines         │     │  - Log thông báo          │
+   │  SET stock = stock - q    │     │  - Gửi hóa đơn điện tử    │
+   │  INSERT INTO orders       │     │    qua Email cho khách    │
+   └───────────────────────────┘     └───────────────────────────┘
+```
+
+### B. Yêu cầu log & Email
+Khi nhận sự kiện, `notification-service` in ra log theo đúng định dạng yêu cầu:
+```
+>>> THÔNG BÁO: Hóa đơn cho đơn hàng [ORD-XXXX] đã được gửi tới khách hàng <<<
+```
+Đồng thời kích hoạt dịch vụ `EmailService` để tạo nội dung hóa đơn điện tử chi tiết và gửi tới email của khách hàng.
+
+### C. Kiểm tra qua REST API (`notification-service`):
+```bash
+# Xem danh sách hóa đơn điện tử đã gửi email
+curl "http://localhost:8084/api/v1/notifications"
+
+# Xem danh sách log thông báo
+curl "http://localhost:8084/api/v1/notifications/logs"
+```
+
+
 
