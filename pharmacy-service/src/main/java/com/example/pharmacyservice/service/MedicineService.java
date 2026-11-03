@@ -4,6 +4,7 @@ import com.example.pharmacyservice.model.Medicine;
 import com.example.pharmacyservice.repository.MedicineRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -38,6 +39,34 @@ public class MedicineService {
         log.info("===> [DATABASE QUERY] Đang truy vấn Database để lấy thông tin thuốc với ID = {}", id);
         return medicineRepository.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Không tìm thấy thuốc có ID: " + id));
+    }
+
+    /**
+     * Cập nhật thông tin thuốc (giá thuốc, số lượng...).
+     * 
+     * Sử dụng @CacheEvict(value = "medicines", key = "#medicine.id"):
+     * Khi cập nhật thuốc thành công, Cache cũ trong Redis sẽ bị xóa ngay lập tức (evicted).
+     * Nhờ đó, lần truy vấn chi tiết thuốc tiếp theo sẽ buộc phải truy vấn lại DB để lấy giá mới nhất.
+     */
+    @CacheEvict(value = "medicines", key = "#medicine.id")
+    public Medicine updateMedicine(Medicine medicine) {
+        log.info("===> [CACHE EVICT] Đã kích hoạt @CacheEvict xóa cache 'medicines' key = {} do thuốc được cập nhật", medicine.getId());
+        Medicine existing = medicineRepository.findById(medicine.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Không tìm thấy thuốc có ID: " + medicine.getId()));
+
+        if (medicine.getName() != null && !medicine.getName().isBlank()) {
+            existing.setName(medicine.getName());
+        }
+        if (medicine.getQuantity() != null) {
+            existing.setQuantity(medicine.getQuantity());
+        }
+        if (medicine.getUnitPrice() != null) {
+            existing.setUnitPrice(medicine.getUnitPrice());
+        }
+
+        Medicine updated = medicineRepository.save(existing);
+        log.info("===> [DATABASE UPDATE] Đã lưu thông tin thuốc mới vào Database: ID={}, Giá={}", updated.getId(), updated.getUnitPrice());
+        return updated;
     }
 
     public List<Medicine> getAllMedicines() {

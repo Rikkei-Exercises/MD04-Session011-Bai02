@@ -496,13 +496,14 @@ curl "http://localhost:8084/api/v1/notifications/logs"
 
 ---
 
-## 10. Bài thực hành: Cấu hình Redis làm Cache Provider & @Cacheable
+## 10. Bài thực hành: Cấu hình Redis Cache Provider, @Cacheable & @CacheEvict
 
 ### A. Bối cảnh & Yêu cầu kỹ thuật
-- **Bối cảnh**: Danh mục thuốc của hiệu thuốc rất lớn (hàng nghìn loại). Mỗi khi khách hàng tìm kiếm hoặc quầy bán lẻ lấy thông tin thuốc, việc truy vấn trực tiếp liên tục vào cơ sở dữ liệu làm hệ thống bị chậm.
-- **Giải pháp**: Tích hợp **Redis làm Cache Provider**, áp dụng `@Cacheable(value = "medicines", key = "#id")` tại hàm lấy chi tiết thuốc:
-  - **Lần 1 (Cache Miss)**: Hệ thống kiểm tra Redis chưa có dữ liệu -> Thực thi hàm truy vấn Database, in câu lệnh SQL ra console log -> Lưu đối tượng thuốc vào Redis dưới dạng JSON.
-  - **Lần 2+ (Cache Hit)**: Hệ thống phát hiện đã có dữ liệu trên Redis -> Trả về kết quả ngay lập tức (< 10ms) mà **KHÔNG** chạy câu lệnh truy vấn xuống Database.
+- **Bối cảnh**: Danh mục thuốc của hiệu thuốc rất lớn (hàng nghìn loại). Mỗi khi khách hàng tìm kiếm hoặc quầy bán lẻ lấy thông tin thuốc, việc truy vấn trực tiếp liên tục vào cơ sở dữ liệu làm hệ thống bị chậm. Đồng thời, thông tin giá thuốc có thể thay đổi. Nếu Cache lưu quá lâu mà không có cơ chế vô hiệu hóa, khách hàng sẽ thấy giá cũ.
+- **Giải pháp**:
+  - Tích hợp **Redis làm Cache Provider**, cấu hình TTL là **60 phút**.
+  - Áp dụng `@Cacheable(value = "medicines", key = "#id")` tại hàm lấy chi tiết thuốc.
+  - Sử dụng `@CacheEvict(value = "medicines", key = "#medicine.id")` tại hàm cập nhật thông tin thuốc. Khi một loại thuốc được sửa giá, Cache cũ bị xóa ngay lập tức để lần truy vấn sau hệ thống sẽ lấy giá mới nhất từ DB.
 
 ---
 
@@ -520,16 +521,16 @@ implementation 'org.springframework.boot:spring-boot-starter-data-redis'
 spring.jpa.show-sql=true
 spring.jpa.properties.hibernate.format_sql=true
 
-# Cấu hình Redis làm Cache Provider
+# Cấu hình Redis làm Cache Provider (TTL = 60 phút = 3600000ms)
 spring.cache.type=redis
 spring.data.redis.host=localhost
 spring.data.redis.port=6379
-spring.cache.redis.time-to-live=600000
+spring.cache.redis.time-to-live=3600000
 spring.cache.redis.cache-null-values=false
 ```
 
 #### 3. Cấu hình Redis JSON Serialization (`RedisConfig.java`):
-Dữ liệu thuốc được lưu trữ trên Redis dưới dạng JSON chuẩn xác, dễ đọc và tối ưu:
+Dữ liệu thuốc được lưu trữ trên Redis dưới dạng JSON chuẩn xác, TTL = 60 phút:
 ```java
 @Configuration
 @EnableCaching
@@ -538,7 +539,7 @@ public class RedisConfig {
     @Bean
     public RedisCacheConfiguration redisCacheConfiguration() {
         return RedisCacheConfiguration.defaultCacheConfig()
-                .entryTtl(Duration.ofMinutes(10))
+                .entryTtl(Duration.ofMinutes(60))
                 .disableCachingNullValues()
                 .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
                 .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(RedisSerializer.json()));
@@ -546,7 +547,7 @@ public class RedisConfig {
 }
 ```
 
-#### 4. Áp dụng `@Cacheable` tại Service (`MedicineService.java`):
+#### 4. Áp dụng `@Cacheable` & `@CacheEvict` tại Service (`MedicineService.java`):
 ```java
 @Service
 public class MedicineService {
@@ -558,30 +559,117 @@ public class MedicineService {
         this.medicineRepository = medicineRepository;
     }
 
+    /**
+     * Lấy chi tiết thuốc theo ID có áp dụng Redis Cache.
+     * Cache Hit: Trả về kết quả từ Redis < 10ms, không chạy SQL.
+     */
     @Cacheable(value = "medicines", key = "#id")
     public Medicine getMedicineById(Long id) {
         log.info("===> [DATABASE QUERY] Đang truy vấn Database để lấy thông tin thuốc với ID = {}", id);
         return medicineRepository.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Không tìm thấy thuốc có ID: " + id));
     }
+
+    /**
+     * Cập nhật thông tin thuốc (sửa giá).
+     * @CacheEvict xóa ngay lập tức key medicines::{id} khỏi Redis.
+     */
+    @CacheEvict(value = "medicines", key = "#medicine.id")
+    public Medicine updateMedicine(Medicine medicine) {
+        log.info("===> [CACHE EVICT] Đã kích hoạt @CacheEvict xóa cache 'medicines' key = {} do thuốc được cập nhật", medicine.getId());
+        Medicine existing = medicineRepository.findById(medicine.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Không tìm thấy thuốc có ID: " + medicine.getId()));
+
+        if (medicine.getName() != null && !medicine.getName().isBlank()) {
+            existing.setName(medicine.getName());
+        }
+        if (medicine.getQuantity() != null) {
+            existing.setQuantity(medicine.getQuantity());
+        }
+        if (medicine.getUnitPrice() != null) {
+            existing.setUnitPrice(medicine.getUnitPrice());
+        }
+
+        return medicineRepository.save(existing);
+    }
 }
 ```
 
 ---
 
-### C. Hướng dẫn kiểm thử thực hành
+### C. Hướng dẫn kiểm thử 4 bước thực hành
 
 #### Cách 1: Chạy tự động qua JUnit Test
 ```powershell
 cd pharmacy-service
 .\gradlew test --tests "com.example.pharmacyservice.MedicineServiceCacheTest"
 ```
-Bộ test tự động xác nhận:
-1. Cấu hình Redis Cache: TTL 10 phút (600s), không cache null, key text, value JSON.
-2. Lần 1 gọi `getMedicineById(1L)`: Repository `findById` được gọi đúng 1 lần (truy vấn DB).
-3. Lần 2 gọi `getMedicineById(1L)`: Trả về từ Cache, Repository `findById` **không** bị gọi thêm lần nào (vẫn 1 lần), thời gian xử lý < 10ms.
+Bộ test tự động kiểm chứng toàn bộ quy trình:
+1. `testRedisCacheConfiguration`: Cấu hình TTL 60 phút, không cache null, key text, value JSON.
+2. `testFirstCallQueriesDatabase`: Gọi lần 1 -> Cache Miss -> Chạy truy vấn DB (gọi 1 lần).
+3. `testSecondCallHitsCacheAndSkipsDatabase`: Gọi lần 2 -> Cache Hit -> Bỏ qua DB, thời gian phản hồi < 10ms.
+4. `testCacheEvictOnUpdateMedicine`: Bước 3 cập nhật giá thuốc -> `@CacheEvict` xóa key trong cache -> Bước 4 gọi lại thuốc ID=1, hệ thống truy vấn lại Database để nạp giá mới nhất!
 
 #### Cách 2: Thực hành trực tiếp qua REST API (curl / Postman)
+
+##### Bước 1: Gọi API lấy thuốc ID=1 (Lần đầu - Cache Miss)
+```bash
+curl -i http://localhost:8081/api/pharmacy/medicines/1
+```
+- **Log Console**: Thấy câu lệnh SQL truy vấn và log của hệ thống:
+  ```text
+  ===> [DATABASE QUERY] Đang truy vấn Database để lấy thông tin thuốc với ID = 1
+  Hibernate: select m1_0.id,m1_0.name,m1_0.quantity,m1_0.unit_price from medicines m1_0 where m1_0.id=?
+  ```
+- **Tốc độ phản hồi**: Chậm hơn do phải truy vấn Database. Kết quả được lưu vào Redis với key `medicines::1`.
+
+##### Bước 2: Gọi lại API lấy thuốc ID=1 lần 2 (Cache Hit)
+```bash
+curl -i http://localhost:8081/api/pharmacy/medicines/1
+```
+- **Log Console**: **Hoàn toàn KHÔNG hiện câu lệnh SQL**, không có log `[DATABASE QUERY]`.
+- **Tốc độ phản hồi**: Cực nhanh (**< 10ms**), Header `X-Response-Time-Millis: 2` ms.
+- Dữ liệu đang được lấy trực tiếp từ Redis Cache.
+
+##### Bước 3 (Chốt hạ): Gọi API cập nhật giá thuốc ID=1 (Sửa giá lên 5000)
+Gửi request `PUT http://localhost:8081/api/pharmacy/medicines/1`:
+```bash
+curl -X PUT http://localhost:8081/api/pharmacy/medicines/1 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "unitPrice": 5000.0
+  }'
+```
+- **Log Console**:
+  ```text
+  ===> [CACHE EVICT] Đã kích hoạt @CacheEvict xóa cache 'medicines' key = 1 do thuốc được cập nhật
+  Hibernate: update medicines set name=?,quantity=?,unit_price=? where id=?
+  ```
+- **Kiểm tra Redis**: Mở Redis Desktop Manager hoặc mở terminal redis-cli gõ:
+  ```bash
+  KEYS *
+  ```
+  -> Key `medicines::1` đã **biến mất hoàn toàn** khỏi Redis do `@CacheEvict` kích hoạt!
+
+##### Bước 4: Gọi lại API lấy thuốc ID=1 sau khi sửa giá
+```bash
+curl -i http://localhost:8081/api/pharmacy/medicines/1
+```
+- **Log Console**: Xuất hiện lại log và câu lệnh SQL:
+  ```text
+  ===> [DATABASE QUERY] Đang truy vấn Database để lấy thông tin thuốc với ID = 1
+  Hibernate: select m1_0.id,m1_0.name,m1_0.quantity,m1_0.unit_price from medicines m1_0 where m1_0.id=?
+  ```
+- **Kết quả trả về**: Chứa giá mới nhất `5000.0`:
+  ```json
+  {
+    "id": 1,
+    "name": "Paracetamol 500mg",
+    "quantity": 100,
+    "unitPrice": 5000.0
+  }
+  ```
+- Hệ thống đã nhận ra Cache cũ đã bị xóa, tự động nạp lại dữ liệu mới nhất từ Database vào Redis Cache.
 
 1. **Khởi động Redis Server**:
    ```powershell

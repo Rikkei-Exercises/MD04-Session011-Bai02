@@ -10,9 +10,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.EnableCaching;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.cache.RedisCacheConfiguration;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -58,10 +55,11 @@ class MedicineServiceCacheTest {
                 .build();
 
         when(medicineRepository.findById(1L)).thenReturn(Optional.of(sampleMedicine));
+        when(medicineRepository.save(any(Medicine.class))).thenAnswer(invocation -> invocation.getArgument(0));
     }
 
     @Test
-    @DisplayName("Cấu hình Redis: TTL 10 phút, không cache null, key serializer và value serializer (JSON)")
+    @DisplayName("Cấu hình Redis: TTL 60 phút, không cache null, key text và value JSON")
     void testRedisCacheConfiguration() {
         assertNotNull(redisConfig, "RedisConfig bean phải tồn tại");
         RedisCacheConfiguration config = redisConfig.redisCacheConfiguration();
@@ -104,5 +102,45 @@ class MedicineServiceCacheTest {
 
         // Tốc độ phản hồi cực nhanh khi lấy từ Cache (< 10ms)
         assertTrue(duration < 10, "Thời gian phản hồi khi lấy từ cache phải < 10ms, thực tế: " + duration + " ms");
+    }
+
+    @Test
+    @DisplayName("Cơ chế @CacheEvict: Khi update giá thuốc -> Cache bị xóa -> Lần truy vấn sau phải gọi lại DB để nạp giá mới")
+    void testCacheEvictOnUpdateMedicine() {
+        // Bước 1: Gọi lần 1 -> Cache Miss -> Truy vấn DB
+        Medicine call1 = medicineService.getMedicineById(1L);
+        assertEquals(2500.0, call1.getUnitPrice());
+        verify(medicineRepository, times(1)).findById(1L);
+
+        // Bước 2: Gọi lần 2 -> Cache Hit -> Lấy từ Cache, KHÔNG gọi lại DB
+        Medicine call2 = medicineService.getMedicineById(1L);
+        assertEquals(2500.0, call2.getUnitPrice());
+        verify(medicineRepository, times(1)).findById(1L); // Vẫn chỉ gọi 1 lần
+
+        // Bước 3: Cập nhật giá thuốc lên 5000.0 -> Kích hoạt @CacheEvict(value = "medicines", key = "#medicine.id")
+        Medicine updateRequest = Medicine.builder()
+                .id(1L)
+                .name("Paracetamol 500mg")
+                .quantity(100)
+                .unitPrice(5000.0)
+                .build();
+
+        // Giả lập sau khi lưu DB, repository.findById trả về đối tượng có giá mới
+        when(medicineRepository.findById(1L)).thenReturn(Optional.of(updateRequest));
+
+        Medicine updated = medicineService.updateMedicine(updateRequest);
+        assertEquals(5000.0, updated.getUnitPrice());
+
+        // Kiểm tra trong Cache xem key '1' đã bị xóa chưa
+        assertNull(Objects.requireNonNull(cacheManager.getCache("medicines")).get(1L),
+                "Key '1' trong cache 'medicines' phải bị xóa ngay lập tức (@CacheEvict)");
+
+        // Bước 4: Gọi lại getMedicineById(1L) sau khi xóa cache
+        // Hệ thống phát hiện Cache trống -> Bắt buộc phải gọi lại DB lần nữa
+        Medicine callAfterEvict = medicineService.getMedicineById(1L);
+        assertEquals(5000.0, callAfterEvict.getUnitPrice(), "Phải nhận được giá mới nhất từ DB là 5000.0");
+
+        // Xác nhận repository.findById đã được gọi lại lần thứ 2!
+        verify(medicineRepository, times(3)).findById(1L); // 1 lần ở bước 1, 1 lần ở bước 3 (update), 1 lần ở bước 4 (query lại)
     }
 }

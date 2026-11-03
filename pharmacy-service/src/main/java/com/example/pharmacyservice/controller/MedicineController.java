@@ -46,4 +46,21 @@ public class MedicineController {
     public ResponseEntity<Medicine> createMedicine(@RequestBody Medicine medicine) {
         return ResponseEntity.ok(medicineService.addMedicine(medicine));
     }
+
+    /**
+     * API Cập nhật thuốc / sửa giá: PUT /api/v1/medicines/{id}
+     * Kích hoạt @CacheEvict xóa cache cũ khỏi Redis ngay lập tức
+     */
+    @PutMapping("/{id}")
+    public ResponseEntity<Medicine> updateMedicine(@PathVariable Long id, @RequestBody Medicine medicine) {
+        medicine.setId(id);
+        Medicine updated = medicineService.updateMedicine(medicine);
+        return ResponseEntity.ok(updated);
+    }
+
+    @PutMapping
+    public ResponseEntity<Medicine> updateMedicineDirect(@RequestBody Medicine medicine) {
+        Medicine updated = medicineService.updateMedicine(medicine);
+        return ResponseEntity.ok(updated);
+    }
 }
