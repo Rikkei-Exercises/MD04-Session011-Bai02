@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hệ Thống Hiệu Thuốc - Thanh Toán & Gửi Sự Kiện Kafka</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+    <style>
+        body {
+            background-color: #f4f6f9;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .header-box {
+            background: linear-gradient(135deg, #0d6efd 0%, #0b5ed7 100%);
+            color: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(13, 110, 253, 0.15);
+            margin-bottom: 24px;
+        }
+        .card {
+            border: none;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+            margin-bottom: 24px;
+        }
+        .card-header {
+            background: white;
+            border-bottom: 1px solid #edf2f7;
+            font-weight: 600;
+            padding: 16px 20px;
+        }
+        .badge-kafka {
+            background-color: #231f20;
+            color: #fff;
+        }
+        .code-block {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 16px;
+            border-radius: 8px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.9rem;
+            max-height: 280px;
+            overflow-y: auto;
+        }
+        .btn-checkout {
+            background: linear-gradient(135deg, #198754 0%, #157347 100%);
+            color: white;
+            font-size: 1.1rem;
+            font-weight: 600;
+            padding: 12px 24px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(25, 135, 84, 0.25);
+            transition: all 0.2s ease;
+        }
+        .btn-checkout:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(25, 135, 84, 0.35);
+            color: white;
+        }
+        .event-card {
+            border-left: 4px solid #198754;
+            background: #f8fff9;
+        }
+    </style>
+</head>
+<body>
+<div class="container py-4">
+
+    <!-- Header Box -->
+    <div class="header-box">
+        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <div>
+                <h2 class="mb-1"><i class="bi bi-capsule-pill me-2"></i>Pharmacy POS - Màn Hình Bán Thuốc</h2>
+                <p class="mb-0 text-white-50">Cấu hình KafkaTemplate gửi OrderEvent dưới dạng JSON vào topic <code>medicine-stock-events</code></p>
+            </div>
+            <div>
+                <span class="badge bg-light text-dark p-2 me-1"><i class="bi bi-hdd-network me-1"></i>Kafka Topic: medicine-stock-events</span>
+                <span class="badge bg-warning text-dark p-2"><i class="bi bi-key-fill me-1"></i>Key: medicineId</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <!-- Cột form thanh toán -->
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-cart-check me-2 text-primary"></i>Thông Tin Đơn Thuốc</span>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="loadMedicines()"><i class="bi bi-arrow-clockwise"></i> Làm mới</button>
+                </div>
+                <div class="card-body">
+                    <form id="orderForm" onsubmit="event.preventDefault(); submitPayment();">
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Chọn thuốc cần bán:</label>
+                            <select id="medicineSelect" class="form-select" onchange="onMedicineChange()">
+                                <option value="1" data-name="Paracetamol 500mg" data-price="2500" data-stock="100">Paracetamol 500mg (Tồn: 100, Giá: 2.500đ)</option>
+                                <option value="2" data-name="Amoxicillin 500mg" data-price="5000" data-stock="50">Amoxicillin 500mg (Tồn: 50, Giá: 5.000đ)</option>
+                                <option value="3" data-name="Vitamin C 1000mg" data-price="3000" data-stock="200">Vitamin C 1000mg (Tồn: 200, Giá: 3.000đ)</option>
+                            </select>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Mã thuốc (medicineId):</label>
+                                <input type="number" id="medicineId" class="form-control" readonly value="1">
+                                <small class="text-muted">Được dùng làm <b>Message Key</b> trong Kafka</small>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Số lượng mua:</label>
+                                <input type="number" id="quantity" class="form-control" min="1" value="2" required oninput="calculateTotal()">
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Tên khách hàng (tuỳ chọn):</label>
+                            <input type="text" id="customerName" class="form-control" placeholder="Nguyễn Văn A">
+                        </div>
+
+                        <div class="p-3 mb-4 rounded bg-light border">
+                            <div class="d-flex justify-content-between mb-1">
+                                <span>Đơn giá:</span>
+                                <span class="fw-bold" id="lblUnitPrice">2.500 đ</span>
+                            </div>
+                            <div class="d-flex justify-content-between mb-1">
+                                <span>Số lượng:</span>
+                                <span class="fw-bold" id="lblQuantity">2</span>
+                            </div>
+                            <hr class="my-2">
+                            <div class="d-flex justify-content-between fs-5 text-success">
+                                <span class="fw-bold">Tổng thanh toán:</span>
+                                <span class="fw-bold" id="lblTotalAmount">5.000 đ</span>
+                            </div>
+                        </div>
+
+                        <!-- NÚT THANH TOÁN THEO YÊU CẦU ĐỀ BÀI -->
+                        <button type="submit" id="btnPay" class="btn btn-checkout w-100">
+                            <i class="bi bi-credit-card-2-front me-2"></i>Thanh Toán
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- Cột kết quả phản hồi và Kafka Event -->
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span><i class="bi bi-broadcast text-danger me-2"></i>Kết Quả Thanh Toán & Kafka Broker</span>
+                    <span id="badgeStatus" class="badge bg-secondary">Chờ thanh toán</span>
+                </div>
+                <div class="card-body">
+                    <div id="emptyPlaceholder" class="text-center py-5 text-muted">
+                        <i class="bi bi-arrow-left-circle display-4 text-primary opacity-50"></i>
+                        <p class="mt-3">Bấm nút <b>"Thanh toán"</b> bên trái để thực hiện giao dịch.<br>KafkaTemplate sẽ gửi sự kiện <code>OrderEvent</code> lên Kafka Broker.</p>
+                    </div>
+
+                    <div id="resultContent" style="display: none;">
+                        <div class="alert alert-success d-flex align-items-center" role="alert">
+                            <i class="bi bi-check-circle-fill fs-4 me-2"></i>
+                            <div>
+                                <strong id="alertMsgTitle">Thanh toán thành công!</strong>
+                                <div id="alertMsgDetail" class="small">Sự kiện đơn hàng đã được KafkaTemplate gửi lên Kafka Broker.</div>
+                            </div>
+                        </div>
+
+                        <div class="card event-card p-3 mb-3">
+                            <div class="row g-2">
+                                <div class="col-sm-6">
+                                    <small class="text-muted d-block">Mã đơn hàng (orderId):</small>
+                                    <strong id="resOrderId" class="text-primary">-</strong>
+                                </div>
+                                <div class="col-sm-6">
+                                    <small class="text-muted d-block">Kafka Topic:</small>
+                                    <span class="badge bg-dark" id="resTopic">medicine-stock-events</span>
+                                </div>
+                                <div class="col-sm-6">
+                                    <small class="text-muted d-block">Message Key (medicineId):</small>
+                                    <span class="badge bg-warning text-dark fs-6" id="resMessageKey">-</span>
+                                </div>
+                                <div class="col-sm-6">
+                                    <small class="text-muted d-block">Partition Route:</small>
+                                    <span class="badge bg-info text-dark" id="resPartition">hash(key) % partitions</span>
+                                </div>
+                                <div class="col-sm-6">
+                                    <small class="text-muted d-block">Số lượng bán (quantity):</small>
+                                    <strong id="resQuantity">-</strong>
+                                </div>
+                                <div class="col-sm-6">
+                                    <small class="text-muted d-block">Thời gian (timestamp):</small>
+                                    <span id="resTimestamp" class="small">-</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <label class="form-label fw-bold small text-muted"><i class="bi bi-filetype-json me-1"></i>OrderEvent JSON Payload gửi lên Kafka:</label>
+                        <pre class="code-block" id="jsonOutput">{}</pre>
+
+                        <div class="small text-muted mt-2">
+                            <i class="bi bi-shield-check text-success me-1"></i><b>Thử thách Partitioning:</b> Do sử dụng <code>medicineId</code> làm Message Key, tất cả các đơn hàng mua cùng loại thuốc sẽ luôn được Kafka băm (hash) và chuyển vào <b>cùng một Partition</b> cố định, bảo đảm tính tuần tự.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let currentPrice = 2500;
+
+    function formatCurrency(amount) {
+        return new Intl.NumberFormat('vi-VN', { style: 'currency', currency: 'VND' }).format(amount);
+    }
+
+    function onMedicineChange() {
+        const select = document.getElementById('medicineSelect');
+        const selected = select.options[select.selectedIndex];
+        document.getElementById('medicineId').value = select.value;
+        currentPrice = parseFloat(selected.getAttribute('data-price') || 2500);
+        calculateTotal();
+    }
+
+    function calculateTotal() {
+        const qty = parseInt(document.getElementById('quantity').value || 1);
+        const total = currentPrice * qty;
+        document.getElementById('lblUnitPrice').innerText = formatCurrency(currentPrice);
+        document.getElementById('lblQuantity').innerText = qty;
+        document.getElementById('lblTotalAmount').innerText = formatCurrency(total);
+    }
+
+    async function loadMedicines() {
+        try {
+            const resp = await fetch('/api/v1/orders/medicines');
+            if (resp.ok) {
+                const list = await resp.json();
+                if (list && list.length > 0) {
+                    const select = document.getElementById('medicineSelect');
+                    select.innerHTML = '';
+                    list.forEach(m => {
+                        const opt = document.createElement('option');
+                        opt.value = m.id;
+                        opt.setAttribute('data-name', m.name);
+                        opt.setAttribute('data-price', m.unitPrice || 2500);
+                        opt.setAttribute('data-stock', m.quantity || 0);
+                        opt.textContent = `${m.name} (Tồn: ${m.quantity}, Giá: ${formatCurrency(m.unitPrice || 2500)})`;
+                        select.appendChild(opt);
+                    });
+                    onMedicineChange();
+                }
+            }
+        } catch (e) {
+            console.log('Cannot load remote medicines, using defaults', e);
+        }
+    }
+
+    async function submitPayment() {
+        const btn = document.getElementById('btnPay');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Đang xử lý & gửi Kafka...';
+
+        const medicineId = parseInt(document.getElementById('medicineId').value);
+        const select = document.getElementById('medicineSelect');
+        const medicineName = select.options[select.selectedIndex]?.getAttribute('data-name') || '';
+        const quantity = parseInt(document.getElementById('quantity').value || 1);
+        const customerName = document.getElementById('customerName').value;
+
+        const payload = {
+            medicineId: medicineId,
+            medicineName: medicineName,
+            quantity: quantity,
+            customerName: customerName,
+            unitPrice: currentPrice
+        };
+
+        try {
+            const response = await fetch('/api/v1/orders/checkout', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const data = await response.json();
+            
+            // Hiển thị kết quả
+            document.getElementById('emptyPlaceholder').style.display = 'none';
+            document.getElementById('resultContent').style.display = 'block';
+
+            document.getElementById('badgeStatus').className = 'badge bg-success';
+            document.getElementById('badgeStatus').innerText = 'Thành công (200 OK)';
+
+            document.getElementById('resOrderId').innerText = data.orderId || '-';
+            document.getElementById('resTopic').innerText = data.topic || 'medicine-stock-events';
+            document.getElementById('resMessageKey').innerText = data.messageKey || String(medicineId);
+            document.getElementById('resPartition').innerText = `Cố định theo Key = ${data.messageKey}`;
+            document.getElementById('resQuantity').innerText = `${data.quantity} hộp/vỉ`;
+            document.getElementById('resTimestamp').innerText = new Date(data.timestamp || Date.now()).toLocaleString('vi-VN');
+
+            document.getElementById('jsonOutput').innerText = JSON.stringify(data.orderEvent, null, 2);
+
+            // Cập nhật lại tồn kho hiển thị
+            loadMedicines();
+        } catch (error) {
+            alert('Lỗi kết nối API: ' + error.message);
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-credit-card-2-front me-2"></i>Thanh Toán';
+        }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+        calculateTotal();
+        loadMedicines();
+    });
+</script>
+</body>
+</html>
