@@ -330,3 +330,114 @@ Kết quả trả về:
 #### Bước 6: Sau 20 giây (wait-duration-in-open-state)
 Mạch tự động chuyển sang `HALF_OPEN`. Khi kho tổng hoạt động lại (`simulate-warehouse?down=false`), các request thành công sẽ đưa mạch trở lại `CLOSED`.
 
+---
+
+## 7. Kiến trúc Event-Driven với Apache Kafka: Producer & Consumer
+
+Hệ thống triển khai mô hình kiến trúc hướng sự kiện (Event-Driven Architecture) giữa 2 Microservices thông qua Apache Kafka:
+- **`pharmacy-service` (Producer - Cổng 8081)**: Khi nhân viên nhấn "Thanh toán" hoặc gọi API bán thuốc, hệ thống phát sinh sự kiện `OrderEvent` và dùng `KafkaTemplate` gửi lên Kafka Broker dưới định dạng JSON vào topic `medicine-stock-events`.
+  - **Partitioning Challenge**: Sử dụng Message Key là `medicineId` (`String.valueOf(medicineId)`). Kafka dùng thuật toán băm (murmur2) `hash(key) % partitions` đảm bảo mọi đơn hàng của cùng một loại thuốc **luôn được định tuyến vào cùng một Partition**, giữ đúng thứ tự giao dịch (ordering guarantee).
+- **`inventory-service` (Consumer - Cổng 8083)**: Lắng nghe topic `medicine-stock-events` thông qua annotation `@KafkaListener` với `group-id: inventory-group`.
+  - Đọc thông tin sự kiện `OrderEvent`.
+  - Thêm mới đơn hàng vào cơ sở dữ liệu (`orders` table).
+  - Thực thi câu lệnh SQL trực tiếp xuống Database:
+    ```sql
+    UPDATE medicines SET stock = stock - quantity WHERE id = medicineId;
+    ```
+  - Cấu hình `group-id: inventory-group` đảm bảo tính nhất quán và xử lý song song không trùng lặp (idempotency).
+
+```
+[Nhân viên bấm Thanh toán / Gọi API]
+                │
+                ▼
+   ┌──────────────────────────┐
+   │     pharmacy-service     │ (Producer - Port 8081)
+   │  KafkaTemplate<JSON>     │
+   └────────────┬─────────────┘
+                │ Topic: medicine-stock-events
+                │ Message Key: medicineId (Partitioning)
+                ▼
+   ┌──────────────────────────┐
+   │       KAFKA BROKER       │ (Port 9092)
+   │  Topic: medicine-stock   │
+   │  - Partition 0           │
+   │  - Partition 1           │
+   │  - Partition 2           │
+   └────────────┬─────────────┘
+                │ @KafkaListener(groupId = "inventory-group")
+                ▼
+   ┌──────────────────────────┐
+   │    inventory-service     │ (Consumer - Port 8083)
+   │ 1. Thêm mới OrderRecord  │
+   │ 2. UPDATE medicines      │
+   │    SET stock = stock - q │
+   └──────────────────────────┘
+```
+
+---
+
+## 8. Chi tiết các thành phần Kafka & Hướng dẫn kiểm thử
+
+### A. Định dạng sự kiện `OrderEvent`
+```java
+public class OrderEvent implements Serializable {
+    private String orderId;    // Mã đơn hàng (VD: ORD-A1B2C3D4)
+    private Long medicineId;   // Mã thuốc (dùng làm Message Key)
+    private Integer quantity;  // Số lượng bán
+    private Long timestamp;    // Thời gian phát sinh đơn hàng
+}
+```
+
+### B. Màn hình Giao diện Web bán thuốc (Pharmacy POS)
+Mở trình duyệt: `http://localhost:8081/`
+- Chọn loại thuốc (Paracetamol, Amoxicillin, Vitamin C).
+- Nhập số lượng và nhấn nút **"Thanh toán"**.
+- Màn hình hiển thị:
+  - Thông báo **"Thanh toán thành công!"**
+  - Chi tiết đơn hàng và sự kiện Kafka (Topic, Message Key, Partition, Payload JSON).
+
+### C. Kiểm thử qua cURL / REST API
+
+#### 1. Gọi API Thanh toán đơn hàng (`pharmacy-service`):
+```bash
+curl -X POST "http://localhost:8081/api/v1/orders/checkout" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "medicineId": 1,
+    "quantity": 3
+  }'
+```
+Phản hồi:
+```json
+{
+  "status": "SUCCESS",
+  "message": "Thanh toán thành công! Sự kiện đơn hàng đã gửi lên Kafka broker.",
+  "orderId": "ORD-5D8E9F1A",
+  "medicineId": 1,
+  "medicineName": "Paracetamol 500mg",
+  "quantity": 3,
+  "totalAmount": 7500.0,
+  "topic": "medicine-stock-events",
+  "messageKey": "1",
+  "orderEvent": {
+    "orderId": "ORD-5D8E9F1A",
+    "medicineId": 1,
+    "quantity": 3,
+    "timestamp": 1730602800000
+  }
+}
+```
+
+#### 2. Kiểm tra tồn kho và đơn hàng tự động cập nhật (`inventory-service`):
+```bash
+# Xem tồn kho sau khi đã trừ (UPDATE medicines SET stock = stock - quantity)
+curl "http://localhost:8083/api/v1/inventory/medicines"
+
+# Xem danh sách đơn hàng được Consumer thêm mới
+curl "http://localhost:8083/api/v1/inventory/orders"
+
+# Xem nhật ký xử lý của Consumer
+curl "http://localhost:8083/api/v1/inventory/logs"
+```
+
+

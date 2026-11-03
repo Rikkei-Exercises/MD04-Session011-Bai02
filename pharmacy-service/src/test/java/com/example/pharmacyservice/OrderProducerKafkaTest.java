@@ -1,49 +1,33 @@
 package com.example.pharmacyservice;
 
 import com.example.pharmacyservice.config.KafkaProducerConfig;
+import com.example.pharmacyservice.controller.OrderController;
+import com.example.pharmacyservice.controller.RetailController;
+import com.example.pharmacyservice.dto.CheckoutResponse;
 import com.example.pharmacyservice.dto.OrderRequest;
 import com.example.pharmacyservice.event.OrderEvent;
 import com.example.pharmacyservice.model.Medicine;
 import com.example.pharmacyservice.repository.MedicineRepository;
 import com.example.pharmacyservice.service.OrderProducerService;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
-import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.argThat;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.atLeastOnce;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 @SpringBootTest
-@AutoConfigureMockMvc
 class OrderProducerKafkaTest {
-
-    @Autowired
-    private MockMvc mockMvc;
-
-    @Autowired
-    private ObjectMapper objectMapper;
 
     @Autowired
     private MedicineRepository medicineRepository;
@@ -54,13 +38,17 @@ class OrderProducerKafkaTest {
     @Autowired
     private OrderProducerService orderProducerService;
 
+    @Autowired
+    private OrderController orderController;
+
+    @Autowired
+    private RetailController retailController;
+
     @BeforeEach
     void setUp() {
-        // Cấu hình mock cho kafkaTemplate.send(...) trả về CompletableFuture completed
         when(kafkaTemplate.send(anyString(), anyString(), any(OrderEvent.class)))
                 .thenReturn(new CompletableFuture<>());
 
-        // Chuẩn bị dữ liệu thuốc mẫu
         if (medicineRepository.findByName("Paracetamol 500mg").isEmpty()) {
             medicineRepository.save(Medicine.builder()
                     .name("Paracetamol 500mg")
@@ -106,18 +94,16 @@ class OrderProducerKafkaTest {
     }
 
     @Test
-    @DisplayName("Kiểm tra API bán thuốc /api/v1/retail/sell: Gửi OrderEvent lên Kafka và phản hồi thành công")
-    void testSellMedicineApiSendsKafkaEvent() throws Exception {
-        mockMvc.perform(post("/api/v1/retail/sell")
-                        .param("medicineName", "Paracetamol 500mg")
-                        .param("quantity", "3"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("SUCCESS"))
-                .andExpect(jsonPath("$.kafkaTopic").value("medicine-stock-events"))
-                .andExpect(jsonPath("$.kafkaMessageKey").exists())
-                .andExpect(jsonPath("$.orderId").exists());
+    @DisplayName("Kiểm tra API bán thuốc sellMedicine: Gửi OrderEvent lên Kafka và phản hồi thành công")
+    void testSellMedicineApiSendsKafkaEvent() {
+        ResponseEntity<Map<String, Object>> response = retailController.sellMedicine("Paracetamol 500mg", 3);
 
-        // Xác nhận kafkaTemplate.send() đã được gọi với topic 'medicine-stock-events'
+        assertNotNull(response.getBody());
+        assertEquals("SUCCESS", response.getBody().get("status"));
+        assertEquals("medicine-stock-events", response.getBody().get("kafkaTopic"));
+        assertNotNull(response.getBody().get("kafkaMessageKey"));
+        assertNotNull(response.getBody().get("orderId"));
+
         verify(kafkaTemplate, atLeastOnce()).send(
                 eq(KafkaProducerConfig.MEDICINE_STOCK_TOPIC),
                 anyString(),
@@ -126,8 +112,8 @@ class OrderProducerKafkaTest {
     }
 
     @Test
-    @DisplayName("Kiểm tra API Thanh toán /api/v1/orders/checkout: Trả về thông tin thanh toán thành công và gửi OrderEvent")
-    void testCheckoutApiSendsKafkaEvent() throws Exception {
+    @DisplayName("Kiểm tra API Thanh toán checkout: Trả về thông tin thanh toán thành công và gửi OrderEvent")
+    void testCheckoutApiSendsKafkaEvent() {
         Medicine med = medicineRepository.findByName("Paracetamol 500mg").orElseThrow();
         OrderRequest request = OrderRequest.builder()
                 .medicineId(med.getId())
@@ -135,20 +121,19 @@ class OrderProducerKafkaTest {
                 .quantity(2)
                 .build();
 
-        mockMvc.perform(post("/api/v1/orders/checkout")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("SUCCESS"))
-                .andExpect(jsonPath("$.message").value("Thanh toán thành công! Sự kiện đơn hàng đã gửi lên Kafka broker."))
-                .andExpect(jsonPath("$.medicineId").value(med.getId()))
-                .andExpect(jsonPath("$.quantity").value(2))
-                .andExpect(jsonPath("$.topic").value("medicine-stock-events"))
-                .andExpect(jsonPath("$.messageKey").value(String.valueOf(med.getId())))
-                .andExpect(jsonPath("$.orderId").exists())
-                .andExpect(jsonPath("$.orderEvent.medicineId").value(med.getId()));
+        ResponseEntity<CheckoutResponse> response = orderController.checkout(request);
 
-        // Kiểm tra kafkaTemplate.send được gọi với topic và key tương ứng
+        CheckoutResponse checkoutRes = response.getBody();
+        assertNotNull(checkoutRes);
+        assertEquals("SUCCESS", checkoutRes.getStatus());
+        assertTrue(checkoutRes.getMessage().contains("Thanh toán thành công"));
+        assertEquals(med.getId(), checkoutRes.getMedicineId());
+        assertEquals(2, checkoutRes.getQuantity());
+        assertEquals("medicine-stock-events", checkoutRes.getTopic());
+        assertEquals(String.valueOf(med.getId()), checkoutRes.getMessageKey());
+        assertNotNull(checkoutRes.getOrderId());
+        assertNotNull(checkoutRes.getOrderEvent());
+
         verify(kafkaTemplate, atLeastOnce()).send(
                 eq(KafkaProducerConfig.MEDICINE_STOCK_TOPIC),
                 eq(String.valueOf(med.getId())),
