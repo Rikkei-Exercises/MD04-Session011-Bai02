@@ -492,3 +492,124 @@ curl "http://localhost:8084/api/v1/notifications/logs"
 
 
 
+
+
+---
+
+## 10. Bài thực hành: Cấu hình Redis làm Cache Provider & @Cacheable
+
+### A. Bối cảnh & Yêu cầu kỹ thuật
+- **Bối cảnh**: Danh mục thuốc của hiệu thuốc rất lớn (hàng nghìn loại). Mỗi khi khách hàng tìm kiếm hoặc quầy bán lẻ lấy thông tin thuốc, việc truy vấn trực tiếp liên tục vào cơ sở dữ liệu làm hệ thống bị chậm.
+- **Giải pháp**: Tích hợp **Redis làm Cache Provider**, áp dụng `@Cacheable(value = "medicines", key = "#id")` tại hàm lấy chi tiết thuốc:
+  - **Lần 1 (Cache Miss)**: Hệ thống kiểm tra Redis chưa có dữ liệu -> Thực thi hàm truy vấn Database, in câu lệnh SQL ra console log -> Lưu đối tượng thuốc vào Redis dưới dạng JSON.
+  - **Lần 2+ (Cache Hit)**: Hệ thống phát hiện đã có dữ liệu trên Redis -> Trả về kết quả ngay lập tức (< 10ms) mà **KHÔNG** chạy câu lệnh truy vấn xuống Database.
+
+---
+
+### B. Cấu hình chi tiết
+
+#### 1. Khai báo dependencies (`pharmacy-service/build.gradle`):
+```groovy
+implementation 'org.springframework.boot:spring-boot-starter-cache'
+implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+```
+
+#### 2. Cấu hình Redis Cache Provider (`application.properties`):
+```properties
+# Bật in câu lệnh SQL để quan sát
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+
+# Cấu hình Redis làm Cache Provider
+spring.cache.type=redis
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+spring.cache.redis.time-to-live=600000
+spring.cache.redis.cache-null-values=false
+```
+
+#### 3. Cấu hình Redis JSON Serialization (`RedisConfig.java`):
+Dữ liệu thuốc được lưu trữ trên Redis dưới dạng JSON chuẩn xác, dễ đọc và tối ưu:
+```java
+@Configuration
+@EnableCaching
+public class RedisConfig {
+
+    @Bean
+    public RedisCacheConfiguration redisCacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10))
+                .disableCachingNullValues()
+                .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(RedisSerializer.json()));
+    }
+}
+```
+
+#### 4. Áp dụng `@Cacheable` tại Service (`MedicineService.java`):
+```java
+@Service
+public class MedicineService {
+
+    private static final Logger log = LoggerFactory.getLogger(MedicineService.class);
+    private final MedicineRepository medicineRepository;
+
+    public MedicineService(MedicineRepository medicineRepository) {
+        this.medicineRepository = medicineRepository;
+    }
+
+    @Cacheable(value = "medicines", key = "#id")
+    public Medicine getMedicineById(Long id) {
+        log.info("===> [DATABASE QUERY] Đang truy vấn Database để lấy thông tin thuốc với ID = {}", id);
+        return medicineRepository.findById(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Không tìm thấy thuốc có ID: " + id));
+    }
+}
+```
+
+---
+
+### C. Hướng dẫn kiểm thử thực hành
+
+#### Cách 1: Chạy tự động qua JUnit Test
+```powershell
+cd pharmacy-service
+.\gradlew test --tests "com.example.pharmacyservice.MedicineServiceCacheTest"
+```
+Bộ test tự động xác nhận:
+1. Cấu hình Redis Cache: TTL 10 phút (600s), không cache null, key text, value JSON.
+2. Lần 1 gọi `getMedicineById(1L)`: Repository `findById` được gọi đúng 1 lần (truy vấn DB).
+3. Lần 2 gọi `getMedicineById(1L)`: Trả về từ Cache, Repository `findById` **không** bị gọi thêm lần nào (vẫn 1 lần), thời gian xử lý < 10ms.
+
+#### Cách 2: Thực hành trực tiếp qua REST API (curl / Postman)
+
+1. **Khởi động Redis Server**:
+   ```powershell
+   # Nếu dùng Docker:
+   docker run -d --name redis-server -p 6379:6379 redis:alpine
+   ```
+
+2. **Khởi động Pharmacy Service**:
+   ```powershell
+   cd pharmacy-service
+   .\gradlew bootRun
+   ```
+
+3. **Gọi lần 1 (Cache Miss)**:
+   ```bash
+   curl -i http://localhost:8081/api/pharmacy/medicines/1
+   ```
+   - **Log Server**:
+     ```text
+     ===> [DATABASE QUERY] Đang truy vấn Database để lấy thông tin thuốc với ID = 1
+     Hibernate: select m1_0.id,m1_0.name,m1_0.quantity,m1_0.unit_price from medicines m1_0 where m1_0.id=?
+     ```
+   - **Response**: Trả về dữ liệu `Paracetamol 500mg`. Dữ liệu lập tức được lưu vào Redis với key `medicines::1`.
+
+4. **Gọi lần 2 (Cache Hit)**:
+   ```bash
+   curl -i http://localhost:8081/api/pharmacy/medicines/1
+   ```
+   - **Log Server**: **HOÀN TOÀN KHÔNG CÓ CÂU LỆNH SQL NÀO**, không có log `[DATABASE QUERY]`.
+   - **Header**: `X-Response-Time-Millis: 2` (phản hồi siêu tốc `< 10ms`).
+   - Dữ liệu được đọc trực tiếp từ Redis Cache, Database hoàn toàn không bị chạm tới!

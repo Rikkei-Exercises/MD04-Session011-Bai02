@@ -2,6 +2,9 @@ package com.example.pharmacyservice.controller;
 
 import com.example.pharmacyservice.model.Medicine;
 import com.example.pharmacyservice.repository.MedicineRepository;
+import com.example.pharmacyservice.service.MedicineService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +19,8 @@ import java.util.Map;
 @RequestMapping("/api/pharmacy")
 public class PharmacyController {
 
+    private static final Logger log = LoggerFactory.getLogger(PharmacyController.class);
+
     @Value("${app.branch-name}")
     private String branchName;
 
@@ -26,9 +31,11 @@ public class PharmacyController {
     private String datasourceUrl;
 
     private final MedicineRepository medicineRepository;
+    private final MedicineService medicineService;
 
-    public PharmacyController(MedicineRepository medicineRepository) {
+    public PharmacyController(MedicineRepository medicineRepository, MedicineService medicineService) {
         this.medicineRepository = medicineRepository;
+        this.medicineService = medicineService;
     }
 
     @GetMapping("/branch-info")
@@ -43,11 +50,27 @@ public class PharmacyController {
 
     @GetMapping("/medicines")
     public ResponseEntity<List<Medicine>> getAllMedicines() {
-        return ResponseEntity.ok(medicineRepository.findAll());
+        return ResponseEntity.ok(medicineService.getAllMedicines());
+    }
+
+    /**
+     * API Lấy chi tiết thuốc theo ID.
+     * Sử dụng Redis Cache qua MedicineService.getMedicineById(id)
+     */
+    @GetMapping("/medicines/{id}")
+    public ResponseEntity<Medicine> getMedicineById(@PathVariable Long id) {
+        long startTime = System.currentTimeMillis();
+        Medicine medicine = medicineService.getMedicineById(id);
+        long duration = System.currentTimeMillis() - startTime;
+        log.info("API GET /api/pharmacy/medicines/{} phản hồi trong {} ms", id, duration);
+
+        return ResponseEntity.ok()
+                .header("X-Response-Time-Millis", String.valueOf(duration))
+                .body(medicine);
     }
 
     @PostMapping("/medicines")
     public ResponseEntity<Medicine> addMedicine(@RequestBody Medicine medicine) {
-        return ResponseEntity.ok(medicineRepository.save(medicine));
+        return ResponseEntity.ok(medicineService.addMedicine(medicine));
     }
 }
